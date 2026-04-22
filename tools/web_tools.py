@@ -59,7 +59,7 @@ from tools.managed_tool_gateway import (
     read_nous_access_token as _read_nous_access_token,
     resolve_managed_tool_gateway,
 )
-from tools.tool_backend_helpers import managed_nous_tools_enabled
+from tools.tool_backend_helpers import managed_nous_tools_enabled, prefers_gateway
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
@@ -88,7 +88,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "minimax"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -117,6 +117,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "minimax":
+        return _has_env("MINIMAX_API_KEY")
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -165,8 +167,8 @@ def _raise_web_backend_configuration_error() -> None:
     )
     if managed_nous_tools_enabled():
         message += (
-            " If you have the hidden Nous-managed tools flag enabled, you can also login to Nous "
-            "(`hermes model`) and provide FIRECRAWL_GATEWAY_URL or TOOL_GATEWAY_DOMAIN."
+            " With your Nous subscription you can also use the Tool Gateway — "
+            "run `hermes tools` and select Nous Subscription as the web provider."
         )
     raise ValueError(message)
 
@@ -176,8 +178,8 @@ def _firecrawl_backend_help_suffix() -> str:
     if not managed_nous_tools_enabled():
         return ""
     return (
-        ", or, if you have the hidden Nous-managed tools flag enabled, login to Nous and use "
-        "FIRECRAWL_GATEWAY_URL or TOOL_GATEWAY_DOMAIN"
+        ", or use the Nous Tool Gateway via your subscription "
+        "(FIRECRAWL_GATEWAY_URL or TOOL_GATEWAY_DOMAIN)"
     )
 
 
@@ -189,6 +191,8 @@ def _web_requires_env() -> list[str]:
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
+        "MINIMAX_API_KEY",
+        "MINIMAX_API_HOST",
     ]
     if managed_nous_tools_enabled():
         requires.extend(
@@ -205,13 +209,14 @@ def _web_requires_env() -> list[str]:
 def _get_firecrawl_client():
     """Get or create Firecrawl client.
 
-    Direct Firecrawl takes precedence when explicitly configured. Otherwise
-    Hermes falls back to the Firecrawl tool-gateway for logged-in Nous Subscribers.
+    When ``web.use_gateway`` is set in config, the Tool Gateway is preferred
+    even if direct Firecrawl credentials are present.  Otherwise direct
+    Firecrawl takes precedence when explicitly configured.
     """
     global _firecrawl_client, _firecrawl_client_config
 
     direct_config = _get_direct_firecrawl_config()
-    if direct_config is not None:
+    if direct_config is not None and not prefers_gateway("web"):
         kwargs, client_config = direct_config
     else:
         managed_gateway = resolve_managed_tool_gateway(
@@ -988,6 +993,60 @@ def _parallel_search(query: str, limit: int = 5) -> dict:
     return {"success": True, "data": {"web": web_results}}
 
 
+# ─── MiniMax Search (Token Plan API) ─────────────────────────────────────────
+
+def _minimax_search(query: str, limit: int = 5) -> dict:
+    """Search using MiniMax Token Plan API — POST /v1/coding_plan/search."""
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    from hermes_cli.config import get_env_value
+    api_key = get_env_value("MINIMAX_API_KEY") or ""
+    api_host = get_env_value("MINIMAX_API_HOST") or "https://api.minimax.io"
+    if not api_key:
+        return {"error": "MINIMAX_API_KEY not configured", "success": False}
+
+    logger.info("MiniMax search: '%s' (limit=%d)", query, limit)
+    url = f"{api_host}/v1/coding_plan/search"
+
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            resp = client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"q": query},
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+
+        # Normalize MiniMax response to Hermes standard format
+        # MiniMax returns: {"organic": [{title, link, snippet, date}], related_searches: [...]}
+        web_results = []
+        for item in (raw.get("organic") or [])[:limit]:
+            web_results.append({
+                "url": item.get("link") or item.get("url") or "",
+                "title": item.get("title") or "",
+                "description": item.get("snippet") or item.get("description") or "",
+                "position": len(web_results) + 1,
+            })
+
+        return {
+            "success": True,
+            "data": {"web": web_results},
+            "related_searches": raw.get("related_searches") or [],
+        }
+    except httpx.HTTPStatusError as e:
+        logger.error("MiniMax search HTTP error: %s", e.response.status_code)
+        return {"error": f"HTTP {e.response.status_code}: {e.response.text[:200]}", "success": False}
+    except Exception as e:
+        logger.error("MiniMax search error: %s", e)
+        return {"error": str(e), "success": False}
+
+
 async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
     """Extract content from URLs using the Parallel async SDK.
 
@@ -1110,6 +1169,16 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "include_images": False,
             })
             response_data = _normalize_tavily_search_results(raw)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "minimax":
+            logger.info("MiniMax search: '%s' (limit: %d)", query, limit)
+            response_data = _minimax_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
