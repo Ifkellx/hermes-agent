@@ -242,6 +242,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "xiaomi": "mimo-v2.5",
     "zai": "glm-5v-turbo",
+    "nous": "xiaomi/mimo-v2-omni",
 }
 
 # Providers whose endpoint does not accept image input, even though the
@@ -1891,6 +1892,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, _MiniMaxCodingPlanVisionClient):
+        return _AsyncMiniMaxCodingPlanVisionClient(sync_client), model
     try:
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
@@ -2474,9 +2477,143 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
 
 
 _VISION_AUTO_PROVIDER_ORDER = (
+    "minimax-coding-plan",
     "openrouter",
     "nous",
 )
+
+
+class _MiniMaxCodingPlanVisionClient:
+    """OpenAI-compatible wrapper for MiniMax Coding Plan VLM API.
+
+    Wraps POST /v1/coding_plan/vlm to look like chat.completions.create().
+    Used by vision_analyze when auxiliary.vision.provider=minimax-coding-plan.
+    """
+
+    def __init__(self, api_key: str, api_host: str = "https://api.minimax.io"):
+        import httpx as _httpx
+        self.api_key = api_key
+        self.api_host = api_host.rstrip("/")
+        self.base_url = self.api_host
+        self._httpx = _httpx
+        # Nested attribute access for OpenAI-compatible interface
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model: str = None, messages: list = None,
+                temperature: float = None, max_tokens: int = None,
+                stream: bool = False, **kwargs):
+        """Emulate OpenAI chat.completions.create() using MiniMax VLM API."""
+        if stream:
+            raise NotImplementedError(
+                "Streaming is not supported by the MiniMax Coding Plan VLM endpoint. "
+                "Use stream=False (the default)."
+            )
+        # Extract prompt and image from OpenAI-format messages
+        prompt_parts = []
+        image_url = None
+        for msg in (messages or []):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                prompt_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if part.get("type") == "text":
+                        prompt_parts.append(part.get("text", ""))
+                    elif part.get("type") == "image_url":
+                        url = part.get("image_url", {})
+                        if isinstance(url, dict):
+                            image_url = url.get("url", "")
+                        else:
+                            image_url = str(url)
+
+        prompt = "\n".join(prompt_parts).strip() or "Describe this image."
+        if not image_url:
+            raise ValueError("MiniMax Coding Plan VLM requires an image_url")
+
+        # Convert local file paths to base64 data URIs
+        if image_url and not image_url.startswith(("data:", "http://", "https://")):
+            import os as _os
+            if _os.path.isfile(image_url):
+                import base64 as _b64
+                with open(image_url, "rb") as _f:
+                    raw = _f.read()
+                ext = _os.path.splitext(image_url)[1].lower()
+                mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                        ".png": "image/png", ".webp": "image/webp",
+                        ".gif": "image/gif"}.get(ext, "image/jpeg")
+                image_url = f"data:{mime};base64,{_b64.b64encode(raw).decode()}"
+
+        # Call VLM API
+        import json as _json
+        with self._httpx.Client(timeout=120) as _client:
+            resp = _client.post(
+                f"{self.api_host}/v1/coding_plan/vlm",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "MM-API-Source": "Hermes-Agent",
+                    "Content-Type": "application/json",
+                },
+                content=_json.dumps({"prompt": prompt, "image_url": image_url}),
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        content_text = data.get("content", "")
+
+        # Return OpenAI-compatible response object
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    role="assistant",
+                    content=content_text,
+                ),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        )
+
+
+class _AsyncMiniMaxCodingPlanVisionClient:
+    """Async wrapper for _MiniMaxCodingPlanVisionClient.
+
+    The async_call_llm() pipeline expects awaitable chat.completions.create().
+    This wraps the sync client with asyncio.to_thread so it works with await.
+    """
+
+    def __init__(self, sync_client: "_MiniMaxCodingPlanVisionClient"):
+        self._sync = sync_client
+        self.api_key = sync_client.api_key
+        self.base_url = sync_client.base_url
+        self.chat = SimpleNamespace(
+            completions=SimpleNamespace(create=self._async_create)
+        )
+
+    async def _async_create(self, **kwargs):
+        import asyncio
+        return await asyncio.to_thread(self._sync.chat.completions.create, **kwargs)
+
+
+def _try_minimax_coding_plan_vision() -> Tuple[Optional[Any], Optional[str]]:
+    """Try MiniMax Coding Plan VLM for vision tasks.
+
+    Uses the Coding Plan API key (MINIMAX_API_KEY) and calls
+    POST /v1/coding_plan/vlm which is NOT OpenAI-compatible.
+    Returns a wrapper client that emulates the OpenAI interface.
+    """
+    api_key = os.environ.get("MINIMAX_API_KEY", "").strip()
+    if not api_key:
+        return None, None
+
+    # Check coding plan env or default
+    api_host = os.environ.get("MINIMAX_API_HOST", "https://api.minimax.io").strip()
+    model = "MiniMax-CodingPlan-VLM"
+
+    logger.debug("Auxiliary vision client: minimax-coding-plan VLM at %s", api_host)
+    try:
+        client = _MiniMaxCodingPlanVisionClient(api_key=api_key, api_host=api_host)
+        return client, model
+    except Exception:
+        return None, None
+
 
 
 def _normalize_vision_provider(provider: Optional[str]) -> str:
@@ -2490,6 +2627,8 @@ def _resolve_strict_vision_backend(
     provider = _normalize_vision_provider(provider)
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
+    if provider == "minimax-coding-plan":
+        return _try_minimax_coding_plan_vision()
     if provider == "openrouter":
         return _try_openrouter()
     if provider == "nous":

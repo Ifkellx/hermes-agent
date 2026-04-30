@@ -299,6 +299,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2.1",
         "MiniMax-M2",
     ],
+    "minimax-coding-plan": [
+        "MiniMax-M2.7",
+        "MiniMax-M2.5",
+        "MiniMax-M2.1",
+        "MiniMax-M2",
+    ],
     "anthropic": [
         "claude-opus-4-7",
         "claude-opus-4-6",
@@ -795,6 +801,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("minimax",        "MiniMax",                  "MiniMax (global direct API)"),
     ProviderEntry("minimax-oauth",  "MiniMax (OAuth)",          "MiniMax via OAuth browser login (Coding Plan, minimax.io)"),
     ProviderEntry("minimax-cn",     "MiniMax (China)",          "MiniMax China (domestic direct API)"),
+    ProviderEntry("minimax-coding-plan", "MiniMax Coding Plan", "MiniMax Coding Plan (api.minimax.io/v1 — OpenAI-compatible)"),
     ProviderEntry("alibaba",        "Alibaba Cloud (DashScope)","Alibaba Cloud / DashScope Coding (Qwen + multi-provider)"),
     ProviderEntry("ollama-cloud",   "Ollama Cloud",             "Ollama Cloud (cloud-hosted open models — ollama.com)"),
     ProviderEntry("arcee",          "Arcee AI",                 "Arcee AI (Trinity models — direct API)"),
@@ -3194,16 +3201,23 @@ def validate_requested_model(
                 ),
             }
 
-    # MiniMax providers don't expose a /models endpoint — validate against
-    # the static catalog instead, similar to openai-codex.
-    if normalized in ("minimax", "minimax-cn"):
+    if normalized in ("minimax", "minimax-cn", "minimax-coding-plan"):
         try:
-            catalog_models = provider_model_ids(normalized)
-        except Exception:
-            catalog_models = []
-        if catalog_models:
+            if normalized == "minimax-coding-plan":
+                # Local catalog for this provider
+                catalog = _PROVIDER_MODELS.get("minimax-coding-plan", [])
+            else:
+                from agent.models_dev import list_provider_models as _list_models
+                catalog = _list_models(normalized) or []
+            if requested_for_lookup in set(catalog):
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "message": None,
+                }
             # Case-insensitive lookup (catalog uses mixed case like MiniMax-M2.7)
-            catalog_lower = {m.lower(): m for m in catalog_models}
+            catalog_lower = {m.lower(): m for m in catalog}
             if requested_for_lookup.lower() in catalog_lower:
                 return {
                     "accepted": True,
@@ -3238,6 +3252,8 @@ def validate_requested_model(
                     "\n  The model may still work if it exists on the server."
                 ),
             }
+        except Exception:
+            pass
 
     # Native Anthropic provider: /v1/models requires x-api-key (or Bearer for
     # OAuth) plus anthropic-version headers.  The generic OpenAI-style probe
@@ -3264,13 +3280,10 @@ def validate_requested_model(
                     "corrected_model": auto[0],
                     "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
                 }
-            suggestions = get_close_matches(requested, anthropic_models, n=3, cutoff=0.5)
+            suggestions = get_close_matches(requested_for_lookup, anthropic_models, n=3, cutoff=0.5)
             suggestion_text = ""
             if suggestions:
                 suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
-            # Accept anyway — Anthropic sometimes gates newer/preview models
-            # (e.g. snapshot IDs, early-access releases) behind accounts
-            # even though they aren't listed on /v1/models.
             return {
                 "accepted": True,
                 "persist": True,
@@ -3285,7 +3298,6 @@ def validate_requested_model(
         # network failure.  Fall through to the generic warning below.
 
     # Anthropic Messages API: many proxies don't implement /v1/models.
-    # Try probing with correct auth; if it fails, accept with a warning.
     if api_mode == "anthropic_messages":
         api_models = fetch_api_models(api_key, base_url, api_mode=api_mode)
         if api_models is not None:

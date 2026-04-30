@@ -126,7 +126,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "minimax-coding-plan"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -137,6 +137,7 @@ def _get_backend() -> str:
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("minimax-coding-plan", _has_env("MINIMAX_API_KEY")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -155,6 +156,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "minimax-coding-plan":
+        return _has_env("MINIMAX_API_KEY")
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -995,6 +998,58 @@ def _exa_extract(urls: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
+# ─── MiniMax Coding Plan Search ─────────────────────────────────────────────
+
+def _minimax_coding_plan_search(query: str, limit: int = 5) -> dict:
+    """Search using the MiniMax Coding Plan API and return normalized results."""
+    import requests as _requests
+
+    api_key = os.environ.get("MINIMAX_API_KEY", "").strip()
+    api_host = os.environ.get("MINIMAX_API_HOST", "https://api.minimax.io").strip().rstrip("/")
+
+    if not api_key:
+        return {"error": "MINIMAX_API_KEY not set", "success": False}
+
+    try:
+        import json as _json
+        resp = _requests.post(
+            f"{api_host}/v1/coding_plan/search",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "MM-API-Source": "Hermes-Agent",
+                "Content-Type": "application/json",
+            },
+            data=_json.dumps({"q": query}),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Normalize to Hermes web search format: {"data": {"web": [...]}}
+        # MiniMax returns search results in its own format — adapt as needed
+        raw_results = data.get("results", data.get("web_pages", []))
+        if not raw_results and isinstance(data, dict):
+            # Try common response formats
+            for key in ("organic", "items", "hits", "data"):
+                raw_results = data.get(key, [])
+                if raw_results:
+                    break
+
+        web_results = []
+        for item in (raw_results if isinstance(raw_results, list) else [])[:limit]:
+            if isinstance(item, dict):
+                web_results.append({
+                    "url": item.get("url", item.get("link", "")),
+                    "title": item.get("title", ""),
+                    "description": item.get("snippet", item.get("description", item.get("text", ""))),
+                })
+
+        return {"data": {"web": web_results}, "success": True}
+    except Exception as e:
+        logger.warning("MiniMax Coding Plan search failed: %s", e)
+        return {"error": str(e), "success": False}
+
+
 # ─── Parallel Search & Extract Helpers ────────────────────────────────────────
 
 def _parallel_search(query: str, limit: int = 5) -> dict:
@@ -1156,6 +1211,16 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "include_images": False,
             })
             response_data = _normalize_tavily_search_results(raw)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "minimax-coding-plan":
+            logger.info("MiniMax Coding Plan search: '%s' (limit: %d)", query, limit)
+            response_data = _minimax_coding_plan_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
