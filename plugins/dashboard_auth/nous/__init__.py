@@ -195,12 +195,12 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
             "code_challenge_method": "S256",
         }
         redirect_url = f"{self._authorize_url}?{urllib.parse.urlencode(params)}"
-        # The auth-route layer expects ``cookie_payload[\"hermes_session_pkce\"]``
-        # as a single semicolon-delimited string of ``key=value`` segments,
+        # The auth-route layer expects ``cookie_payload["hermes_session_pkce"]``
+        # as a single pipe-delimited string of ``key=value`` segments,
         # matching the stub provider's shape. The route handler prepends
         # ``provider=`` so the callback knows which plugin to dispatch to.
         cookie_payload = {
-            "hermes_session_pkce": f"state={state};verifier={code_verifier}",
+            "hermes_session_pkce": f"state={state}|verifier={code_verifier}",
         }
         return LoginStart(redirect_url=redirect_url, cookie_payload=cookie_payload)
 

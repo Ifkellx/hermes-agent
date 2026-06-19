@@ -35,7 +35,7 @@ def _build_app(use_https: bool = True, prefix: str = ""):
     @app.get("/set-pkce")
     def set_pkce():
         r = Response("ok")
-        set_pkce_cookie(r, payload="provider=stub;state=s;verifier=v",
+        set_pkce_cookie(r, payload="provider=stub|state=s|verifier=v",
                         use_https=use_https, prefix=prefix)
         return r
 
@@ -204,14 +204,18 @@ def test_read_session_cookies_missing_returns_none():
 
 
 def test_read_pkce_cookie_round_trip():
+    """PKCE cookie value with '|' delimiter is read back intact."""
     scope = {
         "type": "http",
         "method": "GET",
         "path": "/",
-        "headers": [(b"cookie", f"{PKCE_COOKIE}=state=s;verifier=v".encode())],
+        "headers": [(b"cookie", f"{PKCE_COOKIE}=state=s|verifier=v".encode())],
     }
     req = Request(scope)
-    assert read_pkce_cookie(req) == "state=s"  # NB: cookie value stops at ';'
+    value = read_pkce_cookie(req)
+    parts = dict(seg.split("=", 1) for seg in value.split("|") if "=" in seg)
+    assert parts["state"] == "s"
+    assert parts["verifier"] == "v"
 
 
 def test_detect_https_via_scheme():
@@ -231,3 +235,61 @@ def test_detect_https_via_scheme():
     })
     assert detect_https(http_req) is False
     assert detect_https(https_req) is True
+
+
+def test_pkce_cookie_survives_starlette_round_trip():
+    """Set-Cookie + re-parse Cookie: the value must survive intact."""
+    app = FastAPI()
+
+    @app.get("/set")
+    def set_endpoint():
+        r = Response("ok")
+        set_pkce_cookie(r, payload="provider=nous|state=ABC|verifier=DEF",
+                        use_https=False)
+        return r
+
+    @app.get("/read")
+    def read_endpoint(request: Request):
+        raw = read_pkce_cookie(request)
+        parts = dict(seg.split("=", 1) for seg in raw.split("|") if "=" in seg)
+        return {"provider": parts.get("provider"), "state": parts.get("state"),
+                "verifier": parts.get("verifier")}
+
+    client = TestClient(app)
+    # Set the cookie
+    client.get("/set")
+    # Read it back (TestClient preserves cookies)
+    r = client.get("/read")
+    assert r.json() == {"provider": "nous", "state": "ABC", "verifier": "DEF"}
+
+
+def test_pkce_cookie_backward_compat_with_semicolons():
+    """Reader handles cookies from old format (semicolons) gracefully."""
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "headers": [(b"cookie",
+                     f"{PKCE_COOKIE}=provider=nous|state=ABC|verifier=DEF".encode())],
+    }
+    req = Request(scope)
+    raw = read_pkce_cookie(req)
+    assert raw is not None
+    parts = dict(seg.split("=", 1) for seg in raw.replace(";", "|").split("|") if "=" in seg)
+    assert parts["state"] == "ABC"
+    assert parts["verifier"] == "DEF"
+
+
+def test_pkce_cookie_with_next_path():
+    """next= segment with URL-encoded path survives round trip."""
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "headers": [(b"cookie",
+                     f"{PKCE_COOKIE}=provider=nous|state=ABC|verifier=DEF|next=%2Fsessions".encode())],
+    }
+    req = Request(scope)
+    raw = read_pkce_cookie(req)
+    parts = dict(seg.split("=", 1) for seg in raw.split("|") if "=" in seg)
+    assert parts["next"] == "%2Fsessions"
