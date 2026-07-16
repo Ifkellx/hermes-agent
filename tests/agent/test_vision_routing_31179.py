@@ -234,6 +234,93 @@ auxiliary:
         from tools.vision_tools import check_vision_requirements
         assert check_vision_requirements() is True
 
+    def test_check_vision_falls_back_to_native_main_model(
+        self, isolated_home, monkeypatch
+    ):
+        """A working native fast path must advertise ``vision_analyze`` even
+        when neither the explicit nor automatic auxiliary resolver has a
+        client.  Otherwise the handler can return pixels but the registry
+        removes the tool before the model sees its schema.
+        """
+        _write_config(isolated_home, """
+model:
+  provider: minimax-oauth
+  default: MiniMax-M3
+  supports_vision: true
+agent:
+  image_input_mode: native
+auxiliary:
+  vision:
+    provider: minimax-oauth
+    model: MiniMax-M3
+""")
+        _fresh_modules()
+
+        from unittest.mock import patch
+
+        from tools.registry import invalidate_check_fn_cache
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=(None, None, None),
+        ):
+            invalidate_check_fn_cache()
+            _clear_tool_defs_cache()
+            definitions = get_tool_definitions(
+                enabled_toolsets=["vision"], quiet_mode=True
+            )
+
+        names = {tool["function"]["name"] for tool in definitions}
+        assert "vision_analyze" in names
+
+    def test_check_vision_native_path_survives_auxiliary_probe_error(
+        self, isolated_home, monkeypatch
+    ):
+        """An auxiliary resolver failure must not hide a working native path,
+        and the failure must surface in the log at debug level so config
+        mistakes (typos, missing keys) are still observable.
+        """
+        _write_config(isolated_home, """
+model:
+  provider: minimax-oauth
+  default: MiniMax-M3
+  supports_vision: true
+agent:
+  image_input_mode: native
+""")
+        _fresh_modules()
+
+        from unittest.mock import patch
+
+        from tools.vision_tools import check_vision_requirements
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                side_effect=RuntimeError("auxiliary resolver unavailable"),
+            ),
+            patch(
+                "tools.vision_tools._should_use_native_vision_fast_path",
+                return_value=True,
+            ),
+            patch("tools.vision_tools.logger") as mock_logger,
+        ):
+            assert check_vision_requirements() is True
+
+        # Auxiliary exception captured and logged at debug; native-path log
+        # should NOT fire because the native path succeeded.
+        debug_messages = [
+            call.args[0] % call.args[1:]
+            for call in mock_logger.debug.call_args_list
+        ]
+        assert any("Auxiliary vision probe failed" in m for m in debug_messages), (
+            f"expected auxiliary-probe debug log, got {debug_messages!r}"
+        )
+        assert not any("Native vision fast-path check failed" in m for m in debug_messages), (
+            f"native path should not have errored, got {debug_messages!r}"
+        )
+
     def test_check_vision_false_with_text_only_main_and_no_aggregator(
         self, isolated_home, monkeypatch
     ):

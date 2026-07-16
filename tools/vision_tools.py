@@ -1358,19 +1358,23 @@ async def vision_analyze_tool(
 
 
 def check_vision_requirements() -> bool:
-    """Check if the configured runtime vision path can resolve a client.
+    """Check if either configured vision path is usable.
 
-    Mirrors the fallback chain that ``call_llm(task="vision")`` actually uses
-    at runtime: first the explicit ``auxiliary.vision.provider`` (if any),
-    and if that fails, the auto chain (main provider → openrouter → nous).
-    Without the auto-fallback step the tool would disappear from the model's
-    tool list whenever the explicit provider name was unresolvable, even
-    when the auto chain would have served the request (issue #31179).
+    Mirrors the paths that ``vision_analyze`` can actually use at runtime:
+    first the explicit ``auxiliary.vision.provider`` (if any), then the auto
+    chain (main provider → openrouter → nous), and finally the native fast path
+    where a vision-capable main model receives the pixels directly without an
+    auxiliary client.
+
+    Without the native fallback, the registry hides ``vision_analyze`` when no
+    auxiliary client resolves even though its handler can return a multimodal
+    tool result to the active main model.
     """
     try:
         from agent.auxiliary_client import resolve_vision_provider_client
     except ImportError:
         return False
+    aux_error = None
     try:
         _provider, client, _model = resolve_vision_provider_client()
         if client is not None:
@@ -1378,8 +1382,21 @@ def check_vision_requirements() -> bool:
         # Same fallback to "auto" that call_llm performs when the configured
         # provider can't be resolved.
         _provider, client, _model = resolve_vision_provider_client(provider="auto")
-        return client is not None
-    except Exception:
+        if client is not None:
+            return True
+    except Exception as exc:
+        # Auxiliary probing is optional when the main model can receive pixels
+        # directly. Capture the error so configuration mistakes are visible in
+        # the log at debug level; fall through to the native-path check.
+        aux_error = exc
+    if aux_error is not None:
+        logger.debug("Auxiliary vision probe failed, trying native path: %s", aux_error)
+    try:
+        # Native-capable main models need no auxiliary vision client: the tool
+        # handler attaches the original pixels to its multimodal result.
+        return _should_use_native_vision_fast_path()
+    except Exception as exc:
+        logger.debug("Native vision fast-path check failed: %s", exc)
         return False
 
 
